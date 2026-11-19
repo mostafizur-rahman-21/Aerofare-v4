@@ -13,11 +13,13 @@ This FastAPI service provides two main functions:
 ================================================================================
 """
 
+import json
 import os
+from pathlib import Path
 from datetime import date, datetime, timedelta
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import pandas as pd
@@ -40,6 +42,45 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ------------------------------------------------------------------------------
+# 0. GLOBAL API ENABLE / DISABLE STATE (SYNCED ACROSS ALL DEVICES)
+# ------------------------------------------------------------------------------
+API_CONFIG_PATH = Path(__file__).resolve().parent / "api_config.json"
+
+
+def load_api_config() -> Dict[str, Any]:
+    """Loads the global API configuration from disk."""
+    if API_CONFIG_PATH.exists():
+        try:
+            data = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("api_enabled"), bool):
+                return {"api_enabled": data["api_enabled"]}
+        except Exception as e:
+            print("Warning: Failed to read api_config.json, defaulting to enabled:", e)
+    return {"api_enabled": True}
+
+
+def save_api_config(enabled: bool) -> Dict[str, Any]:
+    """Persists the global API enabled/disabled state."""
+    payload = {"api_enabled": bool(enabled)}
+    API_CONFIG_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
+def is_api_enabled() -> bool:
+    """Returns True if the API is globally enabled."""
+    return bool(load_api_config().get("api_enabled", True))
+
+
+def ensure_api_enabled():
+    """Raises 503 if the administrator has globally disabled the API."""
+    if not is_api_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="AeroFare API is currently disabled by the administrator."
+        )
+
 
 # ------------------------------------------------------------------------------
 # 1. LOAD MACHINE LEARNING MODEL & FEATURE COLUMNS
@@ -75,6 +116,10 @@ class FlightSearch(BaseModel):
         populate_by_name = True
 
 
+class ApiStatusUpdate(BaseModel):
+    api_enabled: bool
+
+
 # ------------------------------------------------------------------------------
 # 3. HELPER FUNCTIONS FOR FEATURE PREPARATION & PREDICTION
 # ------------------------------------------------------------------------------
@@ -106,7 +151,7 @@ def predict_ml_fares_batch(rows: List[dict]) -> List[float]:
     """
     if not rows:
         return []
-    
+
     cleaned_rows = []
     for r in rows:
         row_copy = r.copy()
@@ -149,7 +194,7 @@ def build_analytics_arrays(base_input: dict):
         temp = base_input.copy()
         temp["airline"] = airline_name
         airline_rows.append(temp)
-    
+
     airline_prices = predict_ml_fares_batch(airline_rows)
     airline_comparison = [
         {"airline": ALL_AIRLINES[i].replace("_", " "), "price": airline_prices[i]}
@@ -164,7 +209,7 @@ def build_analytics_arrays(base_input: dict):
         temp = base_input.copy()
         temp["days_left"] = d
         trend_rows.append(temp)
-    
+
     trend_prices = predict_ml_fares_batch(trend_rows)
     booking_trend = [
         {"days_left": trend_days[i], "price": trend_prices[i]}
@@ -217,7 +262,6 @@ def get_train_backup(source: str, dest: str) -> dict:
     pair = (source, dest)
     if pair in TRAIN_BACKUP_DATABASE:
         return TRAIN_BACKUP_DATABASE[pair]
-    # Default fallback
     return {
         "train_name": f"Indian Railways Inter-City Superfast ({source} to {dest})",
         "travel_time": "18h 00m",
@@ -288,7 +332,6 @@ def generate_backup_options(
                     }
                     alternative_dates.append(entry)
 
-                # Identify date with highest savings
                 cheapest_date_entry = min(alternative_dates, key=lambda x: x["estimated_price"])
                 if cheapest_date_entry["is_cheaper"]:
                     best_date_option = cheapest_date_entry
@@ -299,7 +342,6 @@ def generate_backup_options(
     cheaper_airlines = []
     effective_current_price = current_live_price if current_live_price else current_ml_price
 
-    # Check live offers first
     if all_live_offers:
         seen_airlines = set()
         clean_selected = clean_airline_name(selected_airline).lower()
@@ -321,7 +363,6 @@ def generate_backup_options(
                     if len(cheaper_airlines) >= 3:
                         break
 
-    # If no live cheaper airlines found, fallback to ML airline comparison
     if not cheaper_airlines and airline_comparison:
         for item in airline_comparison:
             air = item["airline"]
@@ -412,13 +453,21 @@ def generate_backup_options(
 # ------------------------------------------------------------------------------
 @app.get("/")
 def health_check():
-    """Health check endpoint to verify backend service status."""
+    """Health check endpoint to verify backend service status & global API toggle."""
+    cfg = load_api_config()
     return {
         "status": "AeroFare ML & Telemetry API Online",
         "version": "2.0.0",
+        "api_enabled": cfg["api_enabled"],
         "team": "Team K (Scholars Institute of Technology and Management)",
-        "endpoints": ["/predict", "/analyze"]
+        "endpoints": ["/", "/admin/api-status", "/predict", "/analyze"]
     }
+
+
+@app.post("/admin/api-status")
+def update_api_status(payload: ApiStatusUpdate):
+    """Updates the global API enabled/disabled state across all devices."""
+    return save_api_config(payload.api_enabled)
 
 
 @app.post("/predict")
@@ -427,8 +476,9 @@ def predict_only(search: FlightSearch):
     """
     Standard Mode: ML Fare Estimator
     Predicts the historical fair ticket price using our trained Random Forest model.
-    Also provides alternative dates, carrier comparisons, and train backup.
     """
+    ensure_api_enabled()
+
     days_left = compute_days_left(search)
     display_airline = search.airline.replace("_", " ")
 
@@ -479,9 +529,10 @@ def predict_only(search: FlightSearch):
 def analyze_live_vs_ml(search: FlightSearch):
     """
     Hybrid Mode: ML Fare + Real-Time Market Telemetry
-    Compares live Google Flights market prices against historical ML baseline,
-    detects price surges, and outputs smart backup options when unavailable or expensive.
+    Compares live Google Flights market prices against historical ML baseline.
     """
+    ensure_api_enabled()
+
     days_left = compute_days_left(search)
     display_airline = search.airline.replace("_", " ")
     target_clean = clean_airline_name(search.airline).lower()
@@ -498,11 +549,9 @@ def analyze_live_vs_ml(search: FlightSearch):
         "days_left": days_left,
     }
 
-    # 1. Historical ML Analysed Price
     ml_predicted_price = predict_ml_fare(base_input)
     airline_comparison, booking_trend = build_analytics_arrays(base_input)
 
-    # 2. Fetch live flight offers for route & date
     all_live_offers = []
     if search.travel_date:
         all_live_offers = get_live_flight_offers(
@@ -513,7 +562,6 @@ def analyze_live_vs_ml(search: FlightSearch):
             stops_num=search.stops_num
         )
 
-    # Filter specifically for selected airline
     selected_airline_offers = [
         offer for offer in all_live_offers
         if target_clean in clean_airline_name(offer.get("airline", "")).lower()
@@ -522,7 +570,6 @@ def analyze_live_vs_ml(search: FlightSearch):
 
     market_cheapest = all_live_offers[0] if all_live_offers else None
 
-    # Case A: Selected airline has NO live flights on this date
     if not selected_airline_offers:
         backup_options = generate_backup_options(
             base_input=base_input,
@@ -555,7 +602,6 @@ def analyze_live_vs_ml(search: FlightSearch):
             "backup_options": backup_options
         }
 
-    # Case B: Compare selected airline's live fare against historical ML fare
     lowest_selected_live = selected_airline_offers[0]["live_price"]
     log_live_price_for_retraining(base_input, lowest_selected_live)
 
@@ -569,7 +615,6 @@ def analyze_live_vs_ml(search: FlightSearch):
     else:
         verdict = f"FAIR PRICE on {display_airline}! Live fare closely matches historical fair price ({diff_percent:+}%)."
 
-    # Order flight offers: selected airline at top, followed by competitors
     other_offers = [o for o in all_live_offers if o not in selected_airline_offers]
     ordered_offers = (selected_airline_offers + other_offers)[:6]
 
